@@ -1,202 +1,246 @@
-# bandwidth_monitor.py
-#
-# A lightweight FastAPI endpoint to monitor and report the average
-# network bandwidth usage on a server.
-#
-# This version automatically detects the correct network interface
-# and uses an O(1) running average for high performance.
-#
-# To run this:
-# 1. Install dependencies: pip install "fastapi[all]" psutil
-# 2. Run the server: uvicorn bandwidth_monitor:app --host 0.0.0.0 --port 8000
-# 3. Access the endpoint at: http://<your_server_ip>:8000/api/v1/stats/bandwidth
-
+import os
+import json
 import fastapi
 import uvicorn
 import psutil
 import asyncio
 import time
 import socket
-import threading  # --- OPTIMIZATION 1: Import for thread-safety
+import threading
+import logging
 from collections import deque
-from typing import Deque
+from typing import Deque, Dict, Any
+from pathlib import Path
+from datetime import datetime
+from fastapi import Depends, HTTPException, status
+from fastapi.security import APIKeyHeader
+
+# --- IMPROVEMENT: Basic logging configuration ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Configuration
+SAMPLE_INTERVAL_SECONDS = 5
+MAX_SAMPLES = (12 * 60 * 60) // SAMPLE_INTERVAL_SECONDS
+PERSISTENCE_FILE = Path("monthly_traffic.json")
+SAVE_INTERVAL_MINUTES = 5
+
+# API Key Setup
+API_KEY = os.getenv("BANDWIDTH_API_KEY", "insecure-default-key-change-me")
+if API_KEY == "insecure-default-key-change-me":
+    logging.warning(
+        "You are using a default, insecure API key. Please set BANDWIDTH_API_KEY."
+    )
+
+api_key_header_scheme = APIKeyHeader(name="X-API-Key")
 
 
-# --- HELPER FUNCTION ---
+async def get_api_key(api_key: str = Depends(api_key_header_scheme)):
+    if api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or Missing API Key",
+        )
+
+
+# Helper Functions
 def get_default_interface_name() -> str:
-    """
-    Determines the network interface used for the default route (i.e., to the internet).
-    This is the most reliable way to find the primary interface for monitoring.
-    """
-    print("Attempting to automatically determine the default network interface...")
+    logging.info(
+        "Attempting to automatically determine the default network interface..."
+    )
     try:
-        # Create a dummy UDP socket to connect to a public IP address.
-        # This doesn't send any data but forces the OS to select the correct
-        # interface for outbound traffic based on its routing table.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             local_ip_address = s.getsockname()[0]
-
-        # Now, iterate through all network interfaces on the system.
         for interface_name, snic_addrs in psutil.net_if_addrs().items():
-            # For each interface, check all its assigned addresses.
             for snic_addr in snic_addrs:
-                # We are looking for the interface that has the IP address we just found.
                 if (
                     snic_addr.family == socket.AF_INET
                     and snic_addr.address == local_ip_address
                 ):
-                    print(
+                    logging.info(
                         f"✅ Successfully determined default network interface: '{interface_name}'"
                     )
                     return interface_name
     except Exception as e:
-        print(
-            f"⚠️ Warning: Could not determine default interface via routing. Error: {e}"
+        logging.warning(
+            f"Could not determine default interface, falling back to 'eth0'. Error: {e}"
         )
-
-    # --- Fallback Method ---
-    # If the routing method fails, try to find the first non-loopback interface
-    # that has a valid IPv4 address. This is less precise but works for many simple setups.
-    try:
-        print("Attempting fallback method to find a suitable interface...")
-        all_interfaces = psutil.net_if_addrs()
-        for interface_name, addrs in all_interfaces.items():
-            # Ignore the loopback interface ('lo')
-            if "lo" in interface_name.lower():
-                continue
-            # Check if any address on this interface is an IPv4 address
-            if any(addr.family == socket.AF_INET for addr in addrs):
-                print(
-                    f"✅ Found non-loopback interface as fallback: '{interface_name}'"
-                )
-                return interface_name
-    except Exception as e:
-        print(f"❌ Fallback method also failed. Error: {e}")
-
-    # Final, last-resort fallback to a common default name.
-    print("❌ All detection methods failed. Falling back to 'eth0'.")
-    return "eth0"
+        return "eth0"
 
 
-# --- CONFIGURATION ---
-# The script now calls the helper function on startup to set this variable.
+def format_bytes(byte_count: int) -> str:
+    if byte_count is None:
+        return "0 B"
+    power = 1024
+    n = 0
+    power_labels = {0: "", 1: "K", 2: "M", 3: "G", 4: "T"}
+    while byte_count >= power and n < len(power_labels) - 1:
+        byte_count /= power
+        n += 1
+    return f"{byte_count:.2f} {power_labels[n]}B"
+
+
+# Global State
 NETWORK_INTERFACE = get_default_interface_name()
-
-# How often to sample the network usage, in seconds.
-SAMPLE_INTERVAL_SECONDS = 5
-
-# The number of samples to keep to calculate the average over a time period.
-# Example: (6 hours * 60 minutes/hour * 60 seconds/minute) / 5 seconds/sample = 4320 samples
-MAX_SAMPLES = (12 * 60 * 60) // SAMPLE_INTERVAL_SECONDS
-# --- END CONFIGURATION ---
-
-
-# --- GLOBAL STATE ---
-# --- OPTIMIZATION 1: Use a standard deque and add a running total
-bandwidth_samples: Deque[float] = deque()
-running_total: float = 0.0
+sent_samples: Deque[float] = deque()
+recv_samples: Deque[float] = deque()
+running_total_sent: float = 0.0
+running_total_recv: float = 0.0
+monthly_traffic_state: Dict[str, Any] = {}
 GLOBAL_LOCK = threading.Lock()
-# ---
 app = fastapi.FastAPI()
 
 
-# --- BACKGROUND TASK ---
-async def monitor_bandwidth():
-    """
-    This is a background task that runs continuously. It samples network usage
-    at a set interval and updates the global 'bandwidth_samples' deque
-    and 'running_total' for an O(1) average calculation.
-    """
-    global running_total  # Allow modification of the global variable
+# Persistence Functions
+def load_monthly_traffic():
+    global monthly_traffic_state
+    current_month = datetime.now().strftime("%Y-%m")
+    if PERSISTENCE_FILE.exists():
+        try:
+            with open(PERSISTENCE_FILE, "r") as f:
+                data = json.load(f)
+            if data.get("month") == current_month:
+                monthly_traffic_state = data
+                logging.info(f"✅ Loaded traffic data for month {current_month}.")
+                return
+        except (json.JSONDecodeError, IOError) as e:
+            logging.error(
+                f"Could not read persistence file. Starting fresh. Error: {e}"
+            )
 
-    # --- OPTIMIZATION 4: Simplified initial read
+    logging.info(f"✨ Initializing new traffic log for month {current_month}.")
+    monthly_traffic_state = {
+        "month": current_month,
+        "total_bytes_sent": 0,
+        "total_bytes_recv": 0,
+    }
+
+
+async def save_monthly_traffic_periodically():
+    while True:
+        await asyncio.sleep(SAVE_INTERVAL_MINUTES * 60)
+        with GLOBAL_LOCK:
+            state_to_save = monthly_traffic_state.copy()
+        try:
+            with open(PERSISTENCE_FILE, "w") as f:
+                json.dump(state_to_save, f, indent=4)
+            logging.info("💾 Persisted monthly traffic data.")
+        except IOError as e:
+            logging.error(f"❌ Error saving persistence file: {e}")
+
+
+# Background Tasks
+async def monitor_bandwidth():
+    global running_total_sent, running_total_recv, monthly_traffic_state
     try:
         net_io_initial = psutil.net_io_counters(pernic=True).get(
             NETWORK_INTERFACE, psutil.net_io_counters()
         )
         last_bytes_sent = net_io_initial.bytes_sent
+        last_bytes_recv = net_io_initial.bytes_recv
     except Exception as e:
-        print(
-            f"❌ Fatal Error: Could not get initial network stats. Exiting monitor task. Error: {e}"
+        logging.error(
+            f"❌ FATAL: Could not get initial network stats. Monitoring task will not run. Error: {e}"
         )
         return
 
     last_check_time = time.time()
-
     while True:
         await asyncio.sleep(SAMPLE_INTERVAL_SECONDS)
         current_time = time.time()
         time_delta = current_time - last_check_time
-
         try:
             net_io = psutil.net_io_counters(pernic=True).get(
                 NETWORK_INTERFACE, psutil.net_io_counters()
             )
-            current_bytes_sent = net_io.bytes_sent
-            bytes_delta = current_bytes_sent - last_bytes_sent
-
+            bytes_sent_delta = net_io.bytes_sent - last_bytes_sent
+            bytes_recv_delta = net_io.bytes_recv - last_bytes_recv
             if time_delta > 0:
-                # --- OPTIMIZATION 3: Use 1_000_000 for Megabits (Mbps)
-                # Calculate speed in Megabits per second (Mbps)
-                # (bytes * 8 bits/byte) / 1,000,000 bits/megabit / seconds
-                speed_mbps = (bytes_delta * 8) / 1_000_000 / time_delta
-                # ---
-
-                # --- OPTIMIZATION 1: Update running total
+                speed_sent_mbps = (bytes_sent_delta * 8) / 1_000_000 / time_delta
+                speed_recv_mbps = (bytes_recv_delta * 8) / 1_000_000 / time_delta
                 with GLOBAL_LOCK:
-                    bandwidth_samples.append(speed_mbps)
-                    running_total += speed_mbps
+                    sent_samples.append(speed_sent_mbps)
+                    running_total_sent += speed_sent_mbps
+                    if len(sent_samples) > MAX_SAMPLES:
+                        running_total_sent -= sent_samples.popleft()
 
-                    # If deque is over size, remove the oldest and subtract from total
-                    if len(bandwidth_samples) > MAX_SAMPLES:
-                        oldest_sample = bandwidth_samples.popleft()
-                        running_total -= oldest_sample
-                # ---
+                    recv_samples.append(speed_recv_mbps)
+                    running_total_recv += speed_recv_mbps
+                    if len(recv_samples) > MAX_SAMPLES:
+                        running_total_recv -= recv_samples.popleft()
 
-            last_bytes_sent = current_bytes_sent
+                    current_month = datetime.now().strftime("%Y-%m")
+                    if monthly_traffic_state.get("month") != current_month:
+                        logging.info(
+                            f"🎉 Month rolled over to {current_month}. Resetting monthly traffic."
+                        )
+                        monthly_traffic_state = {
+                            "month": current_month,
+                            "total_bytes_sent": 0,
+                            "total_bytes_recv": 0,
+                        }
+                    monthly_traffic_state["total_bytes_sent"] += bytes_sent_delta
+                    monthly_traffic_state["total_bytes_recv"] += bytes_recv_delta
+
+            last_bytes_sent = net_io.bytes_sent
+            last_bytes_recv = net_io.bytes_recv
             last_check_time = current_time
         except Exception as e:
-            print(f"Error during network stats collection: {e}")
+            logging.error(f"Error during network stats collection: {e}")
 
 
-# --- API ENDPOINT ---
-@app.get("/api/v1/stats/bandwidth")
-def get_average_bandwidth():
-    """
-    Calculates and returns the average bandwidth usage based on collected samples.
-    This is now an O(1) operation, as it just reads the pre-calculated state.
-    """
-    # --- OPTIMIZATION 2: Use lock for thread-safe read
+# API Endpoints
+@app.get("/api/v1/stats/bandwidth", dependencies=[Depends(get_api_key)])
+def get_bandwidth_stats():
     with GLOBAL_LOCK:
-        if not bandwidth_samples:
-            avg_speed = 0.0
-            current_count = 0
+        if not sent_samples:
+            avg_sent, avg_recv, current_count = 0.0, 0.0, 0
         else:
-            current_count = len(bandwidth_samples)
-            avg_speed = running_total / current_count
-    # ---
-
+            current_count = len(sent_samples)
+            avg_sent = running_total_sent / current_count
+            avg_recv = running_total_recv / current_count
     return {
         "network_interface": NETWORK_INTERFACE,
-        "average_speed": {
-            "value": round(avg_speed, 2),
-            "unit": "mbps",
-            "period_seconds": MAX_SAMPLES * SAMPLE_INTERVAL_SECONDS,
+        "average_speed_mbps": {
+            "sent": round(avg_sent, 2),
+            "received": round(avg_recv, 2),
+            "total": round(avg_sent + avg_recv, 2),
         },
+        "period_seconds": MAX_SAMPLES * SAMPLE_INTERVAL_SECONDS,
         "current_sample_count": current_count,
         "max_samples_for_avg": MAX_SAMPLES,
     }
 
 
-# --- FASTAPI LIFECYCLE ---
+@app.get("/api/v1/stats/monthly-traffic", dependencies=[Depends(get_api_key)])
+def get_monthly_traffic():
+    with GLOBAL_LOCK:
+        state = monthly_traffic_state.copy()
+    total_bytes = state.get("total_bytes_sent", 0) + state.get("total_bytes_recv", 0)
+    return {
+        "month": state.get("month"),
+        "data_usage": {
+            "sent": format_bytes(state.get("total_bytes_sent", 0)),
+            "received": format_bytes(state.get("total_bytes_recv", 0)),
+            "total": format_bytes(total_bytes),
+        },
+        "raw_bytes": {
+            "sent": state.get("total_bytes_sent", 0),
+            "received": state.get("total_bytes_recv", 0),
+            "total": total_bytes,
+        },
+    }
+
+
+# FastAPI Lifecycle
 @app.on_event("startup")
 async def startup_event():
-    """
-    Starts the background monitoring task when the server starts.
-    """
-    print("Server starting up...")
+    logging.info("🚀 Server starting up...")
+    load_monthly_traffic()
     asyncio.create_task(monitor_bandwidth())
+    asyncio.create_task(save_monthly_traffic_periodically())
 
 
 if __name__ == "__main__":

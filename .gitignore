@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+# OS
+.DS_Store
+
+# Data files
+monthly_traffic.json
+
+# Dev files
+.flake8
